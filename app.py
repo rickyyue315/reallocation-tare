@@ -69,7 +69,13 @@ def upload_file():
             if not rf_sources.empty:
                 max_effective_sold = group['Effective Sold Qty'].max()
                 rf_sources = rf_sources[rf_sources['Effective Sold Qty'] < max_effective_sold]
-                rf_sources['Transferable Qty'] = rf_sources['SaSa Net Stock'] + rf_sources['Pending Received'] - rf_sources['Safety Stock']
+                
+                # 優先級 2: RF 類型過剩轉出 - 新增轉出限制
+                # 轉出上限為該店舖存貨+Pending Received的20%
+                surplus_qty = rf_sources['SaSa Net Stock'] + rf_sources['Pending Received'] - rf_sources['Safety Stock']
+                transfer_limit = (rf_sources['SaSa Net Stock'] + rf_sources['Pending Received']) * 0.2
+                
+                rf_sources['Transferable Qty'] = np.minimum(surplus_qty, transfer_limit)
                 rf_sources['Priority'] = 2
                 source_candidates.append(rf_sources)
 
