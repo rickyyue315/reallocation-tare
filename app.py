@@ -1,194 +1,203 @@
-from flask import Flask, render_template, request, send_file
+import streamlit as st
 import pandas as pd
-import numpy as np
-import io
-from datetime import datetime
-import os
-import sys
+import time
+from io import BytesIO
+from utils import (
+    preprocess_data, 
+    estimate_transfer_potential,
+    generate_recommendations, 
+    create_om_transfer_chart, 
+    generate_excel_export
+)
 
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-    template_folder = os.path.join(sys._MEIPASS, 'templates')
-    app = Flask(__name__, template_folder=template_folder)
-else:
-    app = Flask(__name__)
+# 1. 頁面配置
+st.set_page_config(
+    page_title="調貨建議生成系統",
+    page_icon="📦",
+    layout="wide"
+)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+# 2. 側邊欄設計
+with st.sidebar:
+    st.header("系統資訊")
+    st.info(""" 
+    **版本：v1.7** 
+    **開發者:Ricky** 
+    
+    **核心功能：**  
+    - ✅ ND/RF類型智慧識別 
+    - ✅ 優先順序調貨匹配 
+    - ✅ RF過剩轉出限制 
+    - ✅ 統計分析和圖表 
+    - ✅ Excel格式匯出 
+    """)
+    st.sidebar.header("操作指引")
+    st.sidebar.markdown("""
+    1.  **上傳 Excel 文件**：點擊瀏覽文件或拖放文件到上傳區域。
+    2.  **啟動分析**：點擊「啟動分析」按鈕開始處理。
+    3.  **查看結果**：在主頁面查看KPI、建議和圖表。
+    4.  **下載報告**：點擊下載按鈕獲取 Excel 報告。
+    """)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return "No file part"
-    file = request.files['file']
-    if file.filename == '':
-        return "No selected file"
-    if file:
-        # 讀取 Excel 檔案
-        df = pd.read_excel(file, dtype={'Article': str})
+# 3. 頁面頭部
+st.title("📦 調貨建議生成系統")
+st.markdown("---")
 
-        # 數據預處理與驗證
-        integer_columns = ['SaSa Net Stock', 'Pending Received', 'Safety Stock', 'Last Month Sold Qty', 'MTD Sold Qty']
-        for col in integer_columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+# 4. 主要區塊
+# 4.1. 資料上傳區塊
+st.header("1. 資料上傳")
+uploaded_file = st.file_uploader(
+    "請上傳包含庫存和銷量數據的 Excel 文件",
+    type=["xlsx", "xls"],
+    help="必需欄位：Article, Article Description, RP Type, Site, OM, SaSa Net Stock, Pending Received, Safety Stock, Last Month Sold Qty, MTD Sold Qty"
+)
 
-        string_columns = ['OM', 'RP Type', 'Site']
-        for col in string_columns:
-            df[col] = df[col].fillna('')
+if uploaded_file is not None:
+    progress_bar = st.progress(0, text="準備開始處理文件...")
+    try:
+        # 文件上傳驗證
+        progress_bar.progress(10, text="正在驗證文件格式...")
+        engine = 'openpyxl' if uploaded_file.name.lower().endswith('xlsx') else 'xlrd'
+        df = pd.read_excel(uploaded_file, engine=engine)
+        progress_bar.progress(25, text="文件讀取成功！正在驗證內容...")
 
-        df['Safety Stock'] = df['Safety Stock'].fillna(0)
-        df['Last Month Sold Qty'] = df['Last Month Sold Qty'].fillna(0)
-        df['MTD Sold Qty'] = df['MTD Sold Qty'].fillna(0)
+        if df.empty:
+            st.error("錯誤：上傳的文件為空，請檢查文件內容。")
+            st.stop()
 
-        df['Notes'] = ''
-        for col in ['Last Month Sold Qty', 'MTD Sold Qty']:
-            df.loc[df[col] < 0, col] = 0
-            out_of_range = df[col] > 100000
-            df.loc[out_of_range, 'Notes'] += '銷量數據超出範圍 '
-            df.loc[out_of_range, col] = 100000
+        st.success("文件上傳與初步驗證成功！")
 
-        # 核心業務邏輯：調貨規則
-        df['Effective Sold Qty'] = np.where(df['Last Month Sold Qty'] > 0, df['Last Month Sold Qty'], df['MTD Sold Qty'])
+        # 4.2. 資料預覽區塊
+        with st.expander("基本統計和資料樣本展示", expanded=False):
+            st.subheader("資料基本統計")
+            st.dataframe(df.describe())
+            st.subheader("資料樣本（前100行）")
+            st.dataframe(df.head(100))
 
-        recommendations = []
+        # 數據預處理
+        progress_bar.progress(40, text="正在進行數據預處理與驗證...")
+        processed_df, logs = preprocess_data(df.copy())
+        progress_bar.progress(60, text="數據預處理完成！")
+
+        # 顯示預處理日誌
+        if logs:
+            with st.expander("查看數據預處理日誌"):
+                for log in logs:
+                    if "錯誤" in log:
+                        st.error(log)
+                    elif "警告" in log:
+                        st.warning(log)
+                    else:
+                        st.info(log)
         
-        for article_om, group in df.groupby(['Article', 'OM']):
-            # 識別轉出候選
-            source_candidates = []
-            # 優先級 1: ND
-            nd_sources = group[group['RP Type'] == 'ND'].copy()
-            nd_sources['Transferable Qty'] = nd_sources['SaSa Net Stock']
-            nd_sources['Priority'] = 1
-            source_candidates.append(nd_sources)
+        if processed_df is not None:
+            st.session_state.cleaned_df = processed_df
 
-            # 優先級 2: RF
-            rf_sources = group[
-                (group['RP Type'] == 'RF') &
-                (group['SaSa Net Stock'] + group['Pending Received'] > group['Safety Stock'])
-            ].copy()
-            if not rf_sources.empty:
-                max_effective_sold = group['Effective Sold Qty'].max()
-                rf_sources = rf_sources[rf_sources['Effective Sold Qty'] < max_effective_sold]
-                
-                # 優先級 2: RF 類型過剩轉出 - 新增轉出限制
-                # 轉出上限為該店舖存貨+Pending Received的20%
-                surplus_qty = rf_sources['SaSa Net Stock'] + rf_sources['Pending Received'] - rf_sources['Safety Stock']
-                transfer_limit = (rf_sources['SaSa Net Stock'] + rf_sources['Pending Received']) * 0.2
-                
-                rf_sources['Transferable Qty'] = np.minimum(surplus_qty, transfer_limit)
-                rf_sources['Priority'] = 2
-                source_candidates.append(rf_sources)
+            # 4.3. 分析按鈕區塊
+            st.header("2. 分析與建議")
 
-            # 識別接收候選
-            destination_candidates = []
-            # 優先級 1: 緊急缺貨
-            urgent_dest = group[
-                (group['RP Type'] == 'RF') &
-                (group['SaSa Net Stock'] == 0) &
-                (group['Effective Sold Qty'] > 0)
-            ].copy()
-            urgent_dest['Needed Qty'] = urgent_dest['Safety Stock']
-            urgent_dest['Priority'] = 1
-            destination_candidates.append(urgent_dest)
-
-            # 優先級 2: 潛在缺貨
-            potential_dest = group[
-                (group['RP Type'] == 'RF') &
-                (group['SaSa Net Stock'] + group['Pending Received'] < group['Safety Stock'])
-            ].copy()
-
-            if not urgent_dest.empty:
-                potential_dest = potential_dest[~potential_dest.index.isin(urgent_dest.index)]
-
-            if not potential_dest.empty:
-                max_effective_sold = group['Effective Sold Qty'].max()
-                potential_dest = potential_dest[potential_dest['Effective Sold Qty'] == max_effective_sold]
-                if not potential_dest.empty:
-                    potential_dest['Needed Qty'] = potential_dest['Safety Stock'] - (potential_dest['SaSa Net Stock'] + potential_dest['Pending Received'])
-                    potential_dest['Priority'] = 2
-                    destination_candidates.append(potential_dest)
-
-
-            # 執行匹配
-            if source_candidates and destination_candidates:
-                sources = pd.concat(source_candidates).sort_values(by='Priority').to_dict('records')
-                dests = pd.concat(destination_candidates).sort_values(by='Priority').to_dict('records')
-
-                for s in sources:
-                    for d in dests:
-                        if s['Transferable Qty'] > 0 and d['Needed Qty'] > 0 and s['Site'] != d['Site']:
-                            transfer_qty = min(s['Transferable Qty'], d['Needed Qty'])
-                            
-                            # Quality Check: Transfer Qty 不得超過轉出店鋪的原始 SaSa Net Stock
-                            original_stock = group.loc[group['Site'] == s['Site'], 'SaSa Net Stock'].iloc[0]
-                            if transfer_qty > original_stock:
-                                transfer_qty = original_stock
-
-                            if transfer_qty > 0:
-                                recommendations.append({
-                                    'Article': s['Article'],
-                                    'Product Desc': s.get('Product Desc', ''), # Assuming Product Desc is in the original df
-                                    'OM': s['OM'],
-                                    'Transfer Site': s['Site'],
-                                    'Receive Site': d['Site'],
-                                    'Transfer Qty': int(transfer_qty),
-                                    'Notes': s['Notes']
-                                })
-                                s['Transferable Qty'] -= transfer_qty
-                                d['Needed Qty'] -= transfer_qty
-
-        # 輸出格式與交付成果
-        if recommendations:
-            rec_df = pd.DataFrame(recommendations)
+            # 預先計算潛在調貨量
+            with st.spinner("正在預先計算潛在調貨量..."):
+                potential = estimate_transfer_potential(st.session_state.cleaned_df.copy())
             
-            # Quality Check
-            rec_df = rec_df[rec_df['Transfer Qty'] > 0]
-            rec_df = rec_df[rec_df['Transfer Site'] != rec_df['Receive Site']]
+            st.subheader("潛在調貨量預估")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("總需求量", f"{potential['total_needed']} 件")
+            col2.metric("A模式潛在可轉出", f"{potential['potential_transfer_A']} 件")
+            col3.metric("B模式潛在可轉出", f"{potential['potential_transfer_B']} 件")
 
-            # 統計摘要
-            total_recommendations = len(rec_df)
-            total_transfer_qty = rec_df['Transfer Qty'].sum()
-
-            article_summary = rec_df.groupby('Article').agg(
-                total_transfer_qty_per_article=pd.NamedAgg(column='Transfer Qty', aggfunc='sum'),
-                om_count=pd.NamedAgg(column='OM', aggfunc='nunique')
-            ).reset_index()
-
-            om_summary = rec_df.groupby('OM').agg(
-                total_transfer_qty_per_om=pd.NamedAgg(column='Transfer Qty', aggfunc='sum'),
-                article_count=pd.NamedAgg(column='Article', aggfunc='nunique')
-            ).reset_index()
+            transfer_mode = st.radio(
+                "請根據預估選擇轉貨力度：",
+                ('A: 保守轉貨', 'B: 加強轉貨'),
+                key='transfer_mode',
+                help="A模式優先保障安全庫存，B模式則更積極地處理滯銷品。"
+            )
             
-            # 轉出類型分析 (需要從原始 df 獲取 RP Type)
-            rec_df_merged = rec_df.merge(df[['Site', 'RP Type']], left_on='Transfer Site', right_on='Site', how='left')
-            transfer_type_summary = rec_df_merged.groupby('RP Type').agg(
-                recommendation_count=pd.NamedAgg(column='Article', aggfunc='size'),
-                total_qty=pd.NamedAgg(column='Transfer Qty', aggfunc='sum')
-            ).reset_index()
+            st.info(f"當前選擇的模式為： **{transfer_mode}**")
 
-            # 接收優先級分析 (需要一個方法來確定接收方的優先級)
-            # For now, we'll skip this part as it requires more complex logic to track.
+            if st.button("🚀 啟動分析生成調貨建議", type="primary"):
+                progress_bar.progress(70, text="正在分析數據並生成建議...")
+                with st.spinner("演算法運行中，請稍候..."):
+                    (
+                        recommendations_df, 
+                        kpi_metrics, 
+                        stats_by_article, 
+                        stats_by_om, 
+                        transfer_type_dist, 
+                        receive_type_dist
+                    ) = generate_recommendations(st.session_state.cleaned_df.copy(), transfer_mode)
+                    time.sleep(1) # 模擬耗時操作
+                progress_bar.progress(90, text="分析完成！正在準備結果展示...")
 
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                rec_df.to_excel(writer, sheet_name='調貨建議 (Transfer Recommendations)', index=False)
-                
-                summary_sheet = writer.book.create_sheet(title='統計摘要 (Summary Dashboard)')
-                summary_sheet.cell(row=1, column=1, value="總調貨建議數量:")
-                summary_sheet.cell(row=1, column=2, value=total_recommendations)
-                summary_sheet.cell(row=2, column=1, value="總調貨件數:")
-                summary_sheet.cell(row=2, column=2, value=total_transfer_qty)
-                
-                # Write summaries to the sheet, leaving space
-                article_summary.to_excel(writer, sheet_name='統計摘要 (Summary Dashboard)', startrow=4, index=False)
-                om_summary.to_excel(writer, sheet_name='統計摘要 (Summary Dashboard)', startrow=4 + len(article_summary) + 2, index=False)
-                transfer_type_summary.to_excel(writer, sheet_name='統計摘要 (Summary Dashboard)', startrow=4 + len(article_summary) + 2 + len(om_summary) + 2, index=False)
+                if not recommendations_df.empty:
+                    st.success("分析完成！")
+                    
+                    # 4.4. 結果展示區塊
+                    st.header("3. 分析結果")
+                    
+                    # KPI 指標卡
+                    st.subheader("關鍵指標 (KPIs)")
+                    cols = st.columns(len(kpi_metrics))
+                    for i, (k, v) in enumerate(kpi_metrics.items()):
+                        cols[i].metric(k, v)
+                    
+                    st.markdown("---")
 
-            output.seek(0)
-            filename = f"調貨建議_{datetime.now().strftime('%Y%m%d')}.xlsx"
-            return send_file(output, download_name=filename, as_attachment=True)
-        else:
-            return "No recommendations generated."
+                    # 調貨建議表格
+                    st.subheader("調貨建議清單")
+                    st.dataframe(recommendations_df)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+                    st.markdown("---")
+
+                    # 統計圖表
+                    st.subheader("詳細統計分析 (Detailed Statistical Analysis)")
+                    
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.write("#### 按產品統計 (Statistics by Article)")
+                        st.dataframe(stats_by_article)
+                        st.write("#### 轉出類型分佈 (Transfer Type Distribution)")
+                        st.dataframe(transfer_type_dist)
+
+                    with col2:
+                        st.write("#### 按OM統計 (Statistics by OM)")
+                        st.dataframe(stats_by_om)
+                        st.write("#### 接收類型分佈 (Receive Type Distribution)")
+                        st.dataframe(receive_type_dist)
+                    
+                    st.markdown("---")
+
+                    # Display the OM Transfer vs Receive Analysis Chart
+                    st.subheader("OM 調貨分析圖表 (OM Transfer vs Receive Analysis Chart)")
+                    om_chart_fig = create_om_transfer_chart(recommendations_df, transfer_mode)
+                    st.pyplot(om_chart_fig)
+
+                    st.success("Analysis complete! You can now download the recommendations.")
+
+                    excel_data = generate_excel_export(
+                        recommendations_df,
+                        kpi_metrics,
+                        stats_by_article,
+                        stats_by_om,
+                        transfer_type_dist,
+                        receive_type_dist,
+                        transfer_mode 
+                    )
+
+                    st.download_button(
+                        label="📥 下載調貨建議 (Excel)",
+                        data=excel_data,
+                        file_name=f"調貨建議_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    progress_bar.progress(100, text="處理完畢！")
+                else:
+                    st.info("根據當前規則，沒有生成任何調貨建議。")
+                    progress_bar.progress(100, text="處理完畢！")
+
+    except Exception as e:
+        st.error(f"處理文件時發生嚴重錯誤: {e}")
+        st.exception(e) # 顯示詳細的錯誤追蹤信息
+        if 'progress_bar' in locals():
+            progress_bar.progress(100, text="處理失敗！")

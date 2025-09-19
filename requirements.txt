@@ -1,4 +1,8 @@
-Flask
-pandas
-numpy
-openpyxl
+streamlit==1.49.1
+pandas==2.3.2
+numpy==2.3.3
+openpyxl==3.1.5
+matplotlib==3.10.6
+seaborn==0.13.2
+xlrd==2.0.2
+xlsxwriter==3.2.9
